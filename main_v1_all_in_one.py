@@ -2,7 +2,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -42,11 +42,9 @@ class ResearchResponse(BaseModel):
     answer: str = Field(
         description="The answer to the user's research question."
     )
-
     confidence: str = Field(
         description="The confidence level of the answer: high, medium, or low."
     )
-
     confidence_percentage: float = Field(
         description=(
             "The system's estimated confidence in the answer, expressed "
@@ -55,16 +53,13 @@ class ResearchResponse(BaseModel):
         ge=0,
         le=100,
     )
-
     sources: List[str] = Field(
         description="A list of source documents used to generate the answer."
     )
-
     key_quotes: List[str] = Field(
         default_factory=list,
         description="Relevant quotations extracted from the source documents.",
     )
-
     follow_up_questions: List[str] = Field(
         default_factory=list,
         description="Suggested follow-up questions for further research.",
@@ -72,7 +67,7 @@ class ResearchResponse(BaseModel):
 
 
 class AIResearchAssistant:
-    """Manage document ingestion, vector storage, and retrieval."""
+    """Manage document ingestion, vector storage, retrieval, and conversations."""
 
     def __init__(
         self,
@@ -99,7 +94,7 @@ class AIResearchAssistant:
         self.embeddings_model = OllamaEmbeddings(
             model="nomic-embed-text:latest"
         )
-        
+
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -111,16 +106,17 @@ class AIResearchAssistant:
             embedding_function=self.embeddings_model,
             collection_name="research_doc",
         )
-        
+
         self.retriever = self._build_retriever()
+
+        self.session_store: Dict[str, InMemoryChatMessageHistory] = {}
 
     def reset_vector_store(self) -> None:
         """Delete the existing collection and recreate an empty one."""
 
         self.vector_store.reset_collection()
-
         self.retriever = self._build_retriever()
-        
+
         print("Vector store reset successfully.")
 
     def add_text(
@@ -221,10 +217,97 @@ class AIResearchAssistant:
             search_kwargs={"k": 4},
         )
 
+    def _get_session_history(
+        self,
+        session_id: str,
+    ) -> BaseChatMessageHistory:
+        """Retrieve an existing session or create a new one."""
+
+        if session_id not in self.session_store:
+            self.session_store[session_id] = InMemoryChatMessageHistory()
+
+        return self.session_store[session_id]
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear conversation history for a specific session."""
+
+        if session_id in self.session_store:
+            self.session_store[session_id].clear()
+            print(f"Cleared Session: {session_id}")
+
+    def get_session_history_display(
+        self,
+        session_id: str,
+    ) -> List[Dict[str, str | Any]]:
+        """Return formatted conversation history for display."""
+
+        if session_id not in self.session_store:
+            return []
+
+        return [
+            {
+                "role": (
+                    "human"
+                    if isinstance(message, HumanMessage)
+                    else "assistant"
+                ),
+                "content": message.content,
+            }
+            for message in self.session_store[session_id].messages
+        ]
+
     def search(self, query: str) -> List[Document]:
         """Retrieve relevant document chunks for a query."""
 
         return self.retriever.invoke(query)
+
+    def ask(
+        self,
+        question: str,
+        session_id: str = "session_id",
+    ) -> str:
+        """Retrieve relevant documents and generate a contextual answer."""
+
+        history = self._get_session_history(session_id)
+
+        docs = self.search(question)
+
+        context = format_search_results(docs)
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an AI research assistant. "
+                    "Answer the user's question using the provided context. "
+                    "All answers must be supported by the sources of the answer. "
+                    "If the context doesn't contain the answer, "
+                    "clearly state that you don't have enough information.\n\n"
+                    "Context:\n{context}",
+                ),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "{question}"),
+            ]
+        )
+
+        chain = prompt | self.llm | StrOutputParser()
+
+        response = chain.invoke(
+            {
+                "context": context,
+                "question": question,
+                "history": history.messages[-10:],
+            }
+        )
+
+        history.add_messages(
+            [
+                HumanMessage(content=question),
+                AIMessage(content=response),
+            ]
+        )
+
+        return response
 
 
 def load_sample_documents() -> List[Document]:
@@ -298,6 +381,62 @@ def load_sample_documents() -> List[Document]:
     ]
 
 
+def print_section(title: str) -> None:
+    """Print a formatted section header."""
+
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
+
+
+def print_vector_store_summary(
+    assistant: AIResearchAssistant,
+    total_chunks: int,
+) -> None:
+    """Display vector store statistics."""
+
+    print_section("VECTOR STORE SUMMARY")
+
+    print(f"Total chunks: {assistant.get_document_count()}")
+    print(f"Chunks added in this run: {total_chunks}")
+    print(f"Sources: {assistant.list_sources()}")
+
+
+def format_search_results(results: List[Document]) -> str:
+    """Format retrieved documents into a context string."""
+
+    if not results:
+        return "No relevant documents were retrieved."
+
+    formatted_results = []
+
+    for index, document in enumerate(results, start=1):
+        formatted_results.append(
+            f"Result {index}\n"
+            f"Source: {document.metadata.get('source', 'unknown')}\n"
+            f"Topic: {document.metadata.get('topic', 'unknown')}\n"
+            f"Chunk: {document.metadata.get('chunk_index', 'unknown')}\n"
+            f"Content:\n{document.page_content}"
+        )
+
+    return "\n\n".join(formatted_results)
+
+
+def print_search_results(
+    query: str,
+    results: List[Document],
+) -> None:
+    """Display retrieved documents in the console."""
+
+    print_section(f"QUERY: {query}")
+
+    if not results:
+        print("No relevant documents were retrieved.")
+        return
+
+    print(format_search_results(results))
+
+
 def main() -> None:
     """Reset the vector store, index sample documents, and test retrieval."""
 
@@ -308,12 +447,9 @@ def main() -> None:
     documents = load_sample_documents()
     total_chunks = assistant.add_documents(documents)
 
-    print("\n" + "=" * 60)
-    print("VECTOR STORE SUMMARY")
-    print("=" * 60)
-    print(f"Total chunks: {assistant.get_document_count()}")
-    print(f"Chunks added in this run: {total_chunks}")
-    print(f"Sources: {assistant.list_sources()}")
+    print_vector_store_summary(assistant, total_chunks)
+
+    session_id = "research_session_1"
 
     test_queries = [
         "How does Retrieval-Augmented Generation work?",
@@ -322,24 +458,22 @@ def main() -> None:
     ]
 
     for query in test_queries:
-        print("\n" + "=" * 60)
-        print(f"QUERY: {query}")
-        print("=" * 60)
+        print_section(f"QUERY: {query}")
 
-        results = assistant.search(query)
+        answer = assistant.ask(
+            question=query,
+            session_id=session_id,
+        )
 
-        if not results:
-            print("No relevant documents were retrieved.")
-            continue
+        print("\nGENERATED ANSWER:")
+        print(answer)
 
-        for index, document in enumerate(results, start=1):
-            print(f"\nResult {index}")
-            print(f"Source: {document.metadata.get('source', 'unknown')}")
-            print(f"Topic: {document.metadata.get('topic', 'unknown')}")
-            print(f"Chunk: {document.metadata.get('chunk_index', 'unknown')}")
-            print(f"Content:\n{document.page_content}")
+    print_section("CONVERSATION HISTORY")
+
+    for message in assistant.get_session_history_display(session_id):
+        print(f"\n{message['role'].upper()}:")
+        print(message["content"])
 
 
 if __name__ == "__main__":
     main()
-
