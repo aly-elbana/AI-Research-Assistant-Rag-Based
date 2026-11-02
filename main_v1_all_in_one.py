@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from enum import Enum
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -34,12 +35,17 @@ DEFAULT_EMBEDDING_MODEL = os.getenv(
 )
 DEFAULT_COLLECTION_NAME = os.getenv("RESEARCH_COLLECTION_NAME", "research_doc")
 
+class ConfidenceLevel(str, Enum):
+    
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 class ResearchResponse(BaseModel):
     """Structured research answer returned to the caller."""
 
     answer: str = Field(description="The answer to the user's research question.")
-    confidence: str = Field(
+    confidence: ConfidenceLevel = Field(
         description="The confidence level of the answer: high, medium, or low."
     )
     confidence_percentage: float = Field(
@@ -224,7 +230,7 @@ class AIResearchAssistant:
                 sources.add(source)
         return sorted(sources)
 
-    @staticmethod
+    @staticmethod 
     def _tokenize(text: str) -> List[str]:
         """Tokenize text for BM25 retrieval."""
 
@@ -429,13 +435,13 @@ class AIResearchAssistant:
 
         key_quotes = extract_key_quotes(docs, question)
         if "don't have enough information" in answer.lower():
-            confidence = "low"
+            confidence = ConfidenceLevel.LOW
             percentage = 25.0
         elif len(docs) >= 2:
-            confidence = "high"
+            confidence = ConfidenceLevel.HIGH
             percentage = min(95.0, 55.0 + (len(docs) * 10))
         else:
-            confidence = "medium"
+            confidence = ConfidenceLevel.MEDIUM
             percentage = 60.0
 
         follow_up_questions = [
@@ -619,8 +625,9 @@ def main() -> None:
 
     queries = [
         "How does Retrieval-Augmented Generation work?",
-        "What are the advantages and limitations of running an LLM locally?",
-        "How can an AI application use MCP to connect to external tools?",
+        "What was the topic and what are the enhancments that can be added to make the agent use the tools "
+        # "What are the advantages and limitations of running an LLM locally?",
+        # "How can an AI application use MCP to connect to external tools?",
     ]
 
     if args.query:
@@ -632,8 +639,11 @@ def main() -> None:
         print("\nRETRIEVED DOCUMENTS:")
         print_search_results(query, results)
         answer = assistant.ask(question=query, session_id=session_id)
+        answer_structured = assistant.research(question=query, session_id=session_id)
         print("\nGENERATED ANSWER:")
         print(answer)
+        print("\nSTRUCTURED ANSWER:")
+        print(answer_structured)
 
     if queries:
         print_section("CONVERSATION HISTORY")
